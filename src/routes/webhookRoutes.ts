@@ -70,10 +70,14 @@ webhookRouter.post('/telegram', async (req, res) => {
       return;
     }
 
-    const [history, scenario] = await Promise.all([
+    const [fullHistory, scenario] = await Promise.all([
       getHistoryForConversation(convo.conversation_id),
       getScenarioContext(convo.conversation_id),
     ]);
+    // Only the last few turns matter for replying to the current message —
+    // sending the entire history overwhelms a small model with repeated
+    // generic check-ins and makes it default to stock phrasing.
+    const history = fullHistory.slice(-6);
 
     const reply = await draftReply(
       {
@@ -82,6 +86,7 @@ webhookRouter.post('/telegram', async (req, res) => {
         currency: convo.currency,
         etaText: scenario?.eta_text ?? null,
         paymentId: convo.payment_id,
+        reasonHint: convo.reason,
       },
       history.map((h) => ({ role: h.role, message: h.message }))
     );
