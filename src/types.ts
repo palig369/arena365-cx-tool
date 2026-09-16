@@ -22,19 +22,12 @@ export interface ConversationState {
   first_seen_at: string;
   agent_last_message_at: string | null;
   last_webhook_flag_at: string | null;
-  // Snapshot of the withdrawal's status/remark from the last poll cycle in
-  // which it was still visible in the feed. Used by poll.ts as a fallback
-  // when the withdrawal later disappears from the feed entirely (no other
-  // pending withdrawal for that user means findResolvedOutcome has nothing
-  // left to search), so we still know its real outcome instead of defaulting
-  // to "unknown".
   last_known_status: string | null;
   last_known_remark: string | null;
+  pending_update_count: number;
+  reason_is_customer_safe: boolean | null;
   resolution_outcome?: string | null;
   resolution_reason?: string | null;
-  // DB-generated (default now() on insert, trigger-updated) — never set by
-  // this app directly, so optional on the insert payloads this type also
-  // doubles as (see createConversation), always present on rows read back.
   created_at?: string;
   updated_at?: string;
 }

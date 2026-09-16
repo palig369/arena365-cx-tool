@@ -7,10 +7,16 @@ import {
   getHistoryForConversation,
   getScenarioContext,
 } from '../db/conversations';
-import { draftReply } from '../ai/drafts';
+import { draftAgentMessage, CHECKIN_INTERVAL_MINUTES, WithdrawalStatus } from '../ai/drafts';
 import { config } from '../config';
 
 export const webhookRouter = Router();
+
+const RESOLUTION_STATUS_MAP: Record<string, WithdrawalStatus> = {
+  completed: 'COMPLETED',
+  rejected: 'REJECTED',
+  failed: 'FAILED',
+};
 
 // Inbound Telegram webhook: https://core.telegram.org/bots/api#update
 webhookRouter.post('/telegram', async (req, res) => {
@@ -79,29 +85,49 @@ webhookRouter.post('/telegram', async (req, res) => {
     // generic check-ins and makes it default to stock phrasing.
     const history = fullHistory.slice(-6);
 
-    const reply = await draftReply(
-      {
-        customerName: convo.customer_name,
-        amount: convo.amount,
-        currency: convo.currency,
-        etaText: scenario?.eta_text ?? null,
-        paymentId: convo.payment_id,
-        reasonHint: convo.reason,
-      },
-      history.map((h) => ({ role: h.role, message: h.message }))
-    );
+    // Narrow timing gap: getOpenConversationByTelegramChatId excludes
+    // status === 'resolved', but a real-world resolution can land between
+    // poll cycles. If a resolution_outcome was already recorded on this row
+    // (e.g. set moments ago but the status flip hasn't been picked up by the
+    // next poll yet), answer against the real recorded outcome instead of
+    // assuming PENDING.
+    const current_status: WithdrawalStatus =
+      convo.resolution_outcome && RESOLUTION_STATUS_MAP[convo.resolution_outcome]
+        ? RESOLUTION_STATUS_MAP[convo.resolution_outcome]
+        : 'PENDING';
 
-    await sendTelegramMessage(chatId, reply);
-    const replyAt = new Date().toISOString();
-    await insertHistory({
-      conversation_id: convo.conversation_id,
-      customer_id: convo.customer_id,
-      role: 'agent',
-      message: reply,
-      sent_at: replyAt,
-      metadata: null,
+    const output = await draftAgentMessage({
+      withdrawal_id: convo.payment_id,
+      amount: convo.amount,
+      currency: convo.currency,
+      current_status,
+      verified_customer_reason: convo.resolution_reason ?? convo.reason,
+      reason_is_customer_safe: convo.reason_is_customer_safe ?? false,
+      next_step_instructions: null,
+      verified_timeframe: scenario?.eta_text ?? null,
+      trigger_type: 'USER_REPLY',
+      next_check_in_minutes: current_status === 'PENDING' ? CHECKIN_INTERVAL_MINUTES : null,
+      pending_update_count: convo.pending_update_count,
+      message_history: history.map((h) => ({ role: h.role, message: h.message })),
     });
-    await updateConversation(convo.conversation_id, { agent_last_message_at: replyAt });
+
+    if (output.send) {
+      await sendTelegramMessage(chatId, output.message);
+      const replyAt = new Date().toISOString();
+      await insertHistory({
+        conversation_id: convo.conversation_id,
+        customer_id: convo.customer_id,
+        role: 'agent',
+        message: output.message,
+        sent_at: replyAt,
+        metadata: null,
+      });
+      await updateConversation(convo.conversation_id, { agent_last_message_at: replyAt });
+    }
+
+    if (output.escalate) {
+      await updateConversation(convo.conversation_id, { status: 'human_required' });
+    }
 
     res.sendStatus(200);
   } catch (err) {

@@ -32,11 +32,21 @@ const GROQ_MODEL = 'openai/gpt-oss-20b';
  * so reasoning_effort is pinned to "low" to keep that budget mostly available
  * for content; without it, reasoning alone can consume the whole budget and
  * come back as an empty completion.
+ *
+ * NOTE: gpt-oss-20b occasionally emits a spontaneous tool-call-shaped response
+ * even though we never pass any `tools` — Groq then rejects the request with
+ * a 400 "Tool choice is none, but model called a tool" error, since there is
+ * nothing to call. response_format: { type: 'json_object' } forces the model
+ * to return plain JSON as regular content instead, which suppresses this
+ * behaviour. As a second line of defence, a single automatic retry is applied
+ * below for both this error and a truncated/empty completion, so one flaky
+ * response doesn't silently drop an entire caller-side operation (e.g. a
+ * poll-cycle check-in).
  */
 class GroqClient implements AIClient {
-  async complete(
+  private async request(
     messages: ChatMessage[],
-    opts: { maxTokens?: number; temperature?: number } = {}
+    opts: { maxTokens?: number; temperature?: number }
   ): Promise<string> {
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
@@ -47,9 +57,10 @@ class GroqClient implements AIClient {
       body: JSON.stringify({
         model: GROQ_MODEL,
         messages,
-        max_tokens: opts.maxTokens ?? 300,
+        max_tokens: opts.maxTokens ?? 400,
         temperature: opts.temperature ?? 0.4,
         reasoning_effort: 'low',
+        response_format: { type: 'json_object' },
       }),
     });
 
@@ -66,6 +77,18 @@ class GroqClient implements AIClient {
       throw new Error('Groq returned an empty completion.');
     }
     return content.trim();
+  }
+
+  async complete(
+    messages: ChatMessage[],
+    opts: { maxTokens?: number; temperature?: number } = {}
+  ): Promise<string> {
+    try {
+      return await this.request(messages, opts);
+    } catch (err) {
+      console.log(`GroqClient.complete: first attempt failed (${(err as Error).message}). Retrying once.`);
+      return await this.request(messages, opts);
+    }
   }
 }
 

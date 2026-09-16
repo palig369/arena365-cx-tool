@@ -33,6 +33,16 @@ export function isManualApprovalHold(remark: string | null | undefined): boolean
   return (remark ?? '').toLowerCase().startsWith('held for manual approval');
 }
 
+// Detects the specific "approved internally, submitted to the payment
+// provider" remark. This means the withdrawal is genuinely moving forward,
+// but is NOT complete yet — the provider still has to confirm it before an
+// admin marks it Completed. Never expose the provider's name to the customer.
+const APPROVED_SUBMITTED_PATTERN = /approved.*submitted/i;
+
+export function isApprovedSubmittedRemark(remark: string | null | undefined): boolean {
+  return APPROVED_SUBMITTED_PATTERN.test((remark ?? '').trim());
+}
+
 export function getWithdrawalAgeMinutes(alert: FeedAlert, now: Date = new Date()): number {
   const created = new Date(alert.createdAt).getTime();
   return (now.getTime() - created) / 60000;
@@ -64,15 +74,17 @@ export function getEtaText(alert: FeedAlert): string | null {
 }
 
 // --- Resolution outcome lookup ---------------------------------------------
-// A withdrawal that's no longer in the top-level alerts list has resolved
-// somehow. Its final status/remark may still be visible in ANY alert's
-// player.recentWithdrawals array (not just its own former alert), because
-// that array is a rolling history keyed by user, and the same user might
-// still have a different withdrawal currently pending. If nothing matches,
-// the entry has fully aged out of the feed's visibility and we genuinely
-// don't know the outcome — callers should fall back to a last-known snapshot
-// (see conversation_state.last_known_status / last_known_remark) rather than
-// treating this null as a final answer.
+// A withdrawal that's no longer pending has resolved somehow. The feed
+// carries this in TWO places that can disagree: the alert's own top-level
+// `status` field (authoritative, updates promptly), and the nested
+// player.recentWithdrawals[] entry for the same paymentId (a secondary copy
+// that has been observed to lag behind and still say "pending" well after
+// the top-level status has already changed). Always trust the top-level
+// status on an alert whose paymentId matches, over any nested copy. Only
+// fall back to searching other alerts' nested arrays (for a withdrawal that
+// has fully disappeared from the top-level list) as a last resort, and even
+// then prefer another alert's own top-level status if that nested search
+// happens to land on its own alert.
 
 export type ResolutionCategory = 'completed' | 'rejected' | 'failed' | 'unknown';
 
@@ -83,6 +95,24 @@ export interface ResolvedOutcome {
 }
 
 export function findResolvedOutcome(paymentId: string, allAlerts: FeedAlert[]): ResolvedOutcome | null {
+  // Pass 1: does any alert's own top-level paymentId/status match, and is
+  // that status non-pending? This is the authoritative, current answer -
+  // check it before ever consulting a nested recentWithdrawals copy.
+  const ownAlert = allAlerts.find((a) => a.paymentId === paymentId);
+  if (ownAlert && ownAlert.status && ownAlert.status !== 'pending') {
+    const match = ownAlert.player?.recentWithdrawals?.find((w) => w._id === paymentId);
+    return {
+      category: classifyOutcome(ownAlert.status, match?.remark ?? null),
+      rawStatus: ownAlert.status,
+      rawRemark: match?.remark ?? null,
+    };
+  }
+
+  // Pass 2: the withdrawal's own alert has vanished from the top-level list
+  // entirely (fully aged out). Search every alert's nested
+  // recentWithdrawals array as a last resort - this is a rolling history
+  // keyed by user, and the same user might still have a different
+  // withdrawal currently pending.
   for (const alert of allAlerts) {
     const match = alert.player?.recentWithdrawals?.find((w) => w._id === paymentId);
     if (match) {
@@ -93,6 +123,7 @@ export function findResolvedOutcome(paymentId: string, allAlerts: FeedAlert[]): 
       };
     }
   }
+
   return null;
 }
 
