@@ -7,6 +7,7 @@ import {
   findResolvedOutcome,
   classifyOutcome,
   isApprovedSubmittedRemark,
+  isCustomerSafeReason,
   getEtaText,
 } from '../feed/withdrawalFeed';
 import { FeedAlert } from '../feed/types';
@@ -102,7 +103,7 @@ async function handleNewWithdrawal(alert: FeedAlert, now: Date, allAlerts: FeedA
     last_known_status: alert.status ?? matched?.status ?? null,
     last_known_remark: matched?.remark ?? null,
     pending_update_count: 0,
-    reason_is_customer_safe: false,
+    reason_is_customer_safe: isCustomerSafeReason(matched?.remark),
   };
 
   await createConversation(conversation);
@@ -131,7 +132,7 @@ async function handleNewWithdrawal(alert: FeedAlert, now: Date, allAlerts: FeedA
         currency: conversation.currency,
         current_status: STATUS_MAP[category],
         verified_customer_reason: outcome?.rawRemark ?? null,
-        reason_is_customer_safe: false,
+        reason_is_customer_safe: isCustomerSafeReason(outcome?.rawRemark),
         next_step_instructions: null,
         verified_timeframe: null,
         trigger_type: 'AUTOMATED_LOOP',
@@ -227,7 +228,7 @@ async function handleResolved(convo: ConversationState, allAlerts: FeedAlert[]):
     currency: convo.currency,
     current_status: STATUS_MAP[category],
     verified_customer_reason: outcome?.rawRemark ?? null,
-    reason_is_customer_safe: convo.reason_is_customer_safe ?? false,
+    reason_is_customer_safe: isCustomerSafeReason(outcome?.rawRemark),
     next_step_instructions: null,
     verified_timeframe: scenario?.eta_text ?? null,
     trigger_type: 'AUTOMATED_LOOP',

@@ -46,6 +46,24 @@ export function isApprovedSubmittedRemark(remark: string | null | undefined): bo
   return APPROVED_SUBMITTED_PATTERN.test((remark ?? '').trim());
 }
 
+// --- Customer-safe reason detection ----------------------------------------
+// Most rejection/failure remarks are internal shorthand (system names, queue
+// states, codes) and must never reach the customer as-is — those stay
+// reason_is_customer_safe: false, and the agent gives a generic "team will
+// follow up" message instead. A small, explicit allowlist of patterns here
+// are reasons that are genuinely customer-actionable and safe to relay
+// plainly (e.g. "wrong wallet address" tells the customer exactly what to
+// fix). Start narrow: only add a new pattern here once you've confirmed the
+// exact wording that reason appears as in the feed / back office, so we never
+// accidentally mark something unsafe as safe.
+const CUSTOMER_SAFE_REASON_PATTERNS = [/wrong wallet/i];
+
+export function isCustomerSafeReason(remark: string | null | undefined): boolean {
+  const text = (remark ?? '').trim();
+  if (!text) return false;
+  return CUSTOMER_SAFE_REASON_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 export function getWithdrawalAgeMinutes(alert: FeedAlert, now: Date = new Date()): number {
   const created = new Date(alert.createdAt).getTime();
   return (now.getTime() - created) / 60000;

@@ -51,6 +51,18 @@ export async function getOpenConversationByTelegramChatId(chatId: string): Promi
   return (data as ConversationState) ?? null;
 }
 
+/** All open (non-resolved) conversations linked to this Telegram chat, most recent first. */
+export async function getOpenConversationsByTelegramChatId(chatId: string): Promise<ConversationState[]> {
+  const { data, error } = await supabase
+    .from('conversation_state')
+    .select('*')
+    .eq('telegram_chat_id', chatId)
+    .neq('status', 'resolved')
+    .order('first_seen_at', { ascending: false });
+  if (error) throw new Error(`Supabase error (getOpenConversationsByTelegramChatId): ${error.message}`);
+  return (data ?? []) as ConversationState[];
+}
+
 /** All conversations, optionally filtered, ordered by most recent activity first. */
 export async function getConversations(filters: {
   status?: ConversationStatus;
