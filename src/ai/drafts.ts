@@ -438,6 +438,20 @@ member of the team can give you more detail if you'd like to follow up."
 Reversed after being completed: "Your withdrawal of 9 USDT has been returned
 to your account balance. You're welcome to submit a new withdrawal request
 whenever you're ready."
+
+With an account mismatch reason: "Unfortunately your withdrawal of 9 USDT was
+rejected because it doesn't match the account used for your deposit. You can
+only withdraw to the same account you deposited from — you're welcome to
+resubmit using that account."
+
+With an active wagering requirement: "Unfortunately your withdrawal was
+rejected because there's still an active wagering requirement on your
+account. Once that's completed, you'll be able to submit the withdrawal
+again."
+
+With an unverified account: "Unfortunately your withdrawal was rejected
+because your account hasn't completed verification yet. Once that's done,
+you'll be able to resubmit the withdrawal."
 `.trim();
 
 function getStateBlock(input: AgentInput): string {

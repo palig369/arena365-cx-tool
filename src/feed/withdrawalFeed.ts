@@ -61,6 +61,10 @@ const CUSTOMER_SAFE_REASON_PATTERNS = [
   /account mismatch/i,
   /wrong ifsc/i,
   /payslip/i,
+  /wagering/i,
+  /not verified/i,
+  /daily limit/i,
+  /unplayed amount/i,
 ];
 
 export function isCustomerSafeReason(remark: string | null | undefined): boolean {
