@@ -49,10 +49,25 @@ export const config = {
  * linked yet is a customer we have no channel for, not a test case — we must not
  * redirect their messages into the tester's personal chat. The check is "is this
  * customer_id a test user", never "is telegram_chat_id empty".
+ *
+ * SAFETY NET: even if a conversation row already has TEST_TELEGRAM_CHAT_ID stored
+ * as its telegram_chat_id (e.g. from old/bad data created before this gating
+ * existed, or any future bug that mislinks it), we refuse to use it unless the
+ * customer is currently a listed test user. A non-test customer should never be
+ * able to end up wired to the tester's personal chat, no matter how that value
+ * got onto their row.
  */
 export function resolveTelegramChatId(customerId: string, telegramChatId: string | null): string | null {
-  if (telegramChatId) return telegramChatId;
-  if (config.testTelegramChatId && config.testUserIds?.includes(customerId)) {
+  const isTestUser = Boolean(config.testUserIds?.includes(customerId));
+
+  if (telegramChatId) {
+    if (telegramChatId === config.testTelegramChatId && !isTestUser) {
+      return null;
+    }
+    return telegramChatId;
+  }
+
+  if (config.testTelegramChatId && isTestUser) {
     return config.testTelegramChatId;
   }
   return null;

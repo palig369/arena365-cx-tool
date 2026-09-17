@@ -9,11 +9,14 @@ export async function fetchWithdrawalFeed(): Promise<FeedAlert[]> {
   const data = (await res.json()) as FeedResponse;
   const alerts = Array.isArray(data?.alerts) ? data.alerts : [];
 
-  if (!config.testUserIds || config.testUserIds.length === 0) {
-    return alerts;
-  }
-  // Testing mode: only act on the configured test users so we don't message real customers.
-  return alerts.filter((alert) => config.testUserIds!.includes(alert.userId));
+  // Every pending withdrawal is processed (detected, drafted, logged) regardless
+  // of who it belongs to, so we can observe the whole flow for every customer.
+  // Actual delivery is still gated separately in resolveTelegramChatId/
+  // logAndMaybeSend: only TEST_USER_IDS get a real Telegram send today, since
+  // Telegram is a test-only channel. Real customers get everything processed
+  // and logged to conversation history, just not delivered anywhere yet
+  // (no live channel exists for them until the V3 integration lands).
+  return alerts;
 }
 
 /**
