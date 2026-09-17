@@ -18,10 +18,8 @@ function optionalEnv(name: string): string | undefined {
 export const config = {
   supabaseUrl: requireEnv('SUPABASE_URL'),
   supabaseServiceKey: requireEnv('SUPABASE_SERVICE_KEY'),
-  groqApiKey: requireEnv('GROQ_API_KEY'),
-  // OpenRouter is currently unused (kept around in case we switch back — see src/ai/client.ts).
-  // Not required so the app still runs if this is left blank.
-  openRouterApiKey: optionalEnv('OPENROUTER_API_KEY'),
+  // Anthropic is the sole AI brain for all customer messaging (replaced Groq/OpenRouter).
+  anthropicApiKey: requireEnv('ANTHROPIC_API_KEY'),
   telegramBotToken: requireEnv('TELEGRAM_BOT_TOKEN'),
   withdrawalFeedUrl: requireEnv('WITHDRAWAL_FEED_URL'),
 

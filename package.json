@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.126.0",
     "@supabase/supabase-js": "^2.45.4",
     "dotenv": "^16.4.5",
     "express": "^4.21.0"
