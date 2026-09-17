@@ -56,7 +56,12 @@ export function isApprovedSubmittedRemark(remark: string | null | undefined): bo
 // fix). Start narrow: only add a new pattern here once you've confirmed the
 // exact wording that reason appears as in the feed / back office, so we never
 // accidentally mark something unsafe as safe.
-const CUSTOMER_SAFE_REASON_PATTERNS = [/wrong wallet/i];
+const CUSTOMER_SAFE_REASON_PATTERNS = [
+  /wrong wallet/i,
+  /account mismatch/i,
+  /wrong ifsc/i,
+  /payslip/i,
+];
 
 export function isCustomerSafeReason(remark: string | null | undefined): boolean {
   const text = (remark ?? '').trim();

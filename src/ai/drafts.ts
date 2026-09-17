@@ -398,6 +398,13 @@ reason available or the reason is not customer-safe.
 If verified_customer_reason is present and reason_is_customer_safe is true:
 give the reason accurately, without softening or changing its meaning.
 
+If verified_customer_reason indicates the withdrawal was previously completed
+and has now been reversed (e.g. mentions a refund, reversal, or the amount
+being returned to balance): tell the customer plainly that the amount has been
+returned to their account balance, and that they are welcome to submit a new
+withdrawal request. This is meaningfully different from a standard rejection —
+lead with the refund, not with "rejected".
+
 If verified_customer_reason is null: say the withdrawal was rejected and that
 a member of the team can give more detail. Do not invent a reason.
 
@@ -427,6 +434,10 @@ because [verified reason]. [Next step, if provided.]"
 
 With no reason available: "Unfortunately your withdrawal was rejected. A
 member of the team can give you more detail if you'd like to follow up."
+
+Reversed after being completed: "Your withdrawal of 9 USDT has been returned
+to your account balance. You're welcome to submit a new withdrawal request
+whenever you're ready."
 `.trim();
 
 function getStateBlock(input: AgentInput): string {
