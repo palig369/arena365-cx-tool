@@ -1,9 +1,3 @@
-// Fixed copy for INTERNAL-ONLY log entries (role: 'system', never sent to the
-// customer). Every customer-facing message is AI-drafted through aiClient.complete
-// (see src/ai/drafts.ts) so it goes through the same honesty-rule reasoning step
-// every time; these are just audit-trail notes, not something anyone reads as
-// support copy, so a fixed string is fine here.
-
 export function escalationInternalNote(ageMinutes: number): string {
   return `Escalated directly to human review. Withdrawal was already ${Math.round(
     ageMinutes
@@ -18,13 +12,6 @@ export function resolvedWhileTakenOverNote(paymentId: string): string {
   return `Payment ${paymentId} is no longer showing as pending in the feed. Marking resolved. Customer was not auto-messaged because a human agent has taken control; let them know directly.`;
 }
 
-/**
- * Sent when a customer with multiple open withdrawals sends an ambiguous
- * reply (no reference or amount that clearly matches just one of them).
- * This is a plain templated message, not an AI-drafted one, because its
- * only job is to ask which withdrawal they mean — there's no state or
- * reasoning involved.
- */
 export function multipleOpenWithdrawalsClarification(
   conversations: { amount: number | null; currency: string | null; payment_id: string }[]
 ): string {
@@ -37,4 +24,18 @@ export function multipleOpenWithdrawalsClarification(
     ...lines,
     'Could you let me know which one you mean, either by number or by quoting the reference?',
   ].join('\n');
+}
+
+export function askForReferenceIdClarification(): string {
+  return [
+    "I want to make sure I look into the right withdrawal for you — could you share the reference number from your withdrawal request?",
+    "It's the code we send in our messages about it, usually a short string of letters and numbers.",
+  ].join(' ');
+}
+
+export function noRecordFoundNote(): string {
+  return [
+    "I don't have a record of a withdrawal matching this on my end.",
+    "I've flagged this for a member of the team to look into directly — if you have a reference number handy, feel free to share it and I can take another look.",
+  ].join(' ');
 }

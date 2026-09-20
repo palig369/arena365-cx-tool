@@ -36,7 +36,7 @@ export const config = {
   testTelegramChatId: optionalEnv('TEST_TELEGRAM_CHAT_ID'),
 
   port: Number(optionalEnv('PORT') ?? '3000'),
-  pollIntervalMinutes: Number(optionalEnv('POLL_INTERVAL_MINUTES') ?? '2'),
+  pollIntervalSeconds: Number(optionalEnv('POLL_INTERVAL_SECONDS') ?? '30'),
 } as const;
 
 /**

@@ -1,15 +1,21 @@
 import { Router } from 'express';
-import { TelegramUpdate, sendTelegramMessage } from '../channels/telegram';
+import { TelegramUpdate, sendTelegramMessage, downloadAndStoreTelegramPhoto } from '../channels/telegram';
 import {
   getOpenConversationsByTelegramChatId,
+  getAllConversationsByTelegramChatId,
   insertHistory,
   updateConversation,
   getHistoryForConversation,
   getScenarioContext,
 } from '../db/conversations';
 import { draftAgentMessage, CHECKIN_INTERVAL_MINUTES, WithdrawalStatus } from '../ai/drafts';
-import { multipleOpenWithdrawalsClarification } from '../messages/templates';
+import {
+  multipleOpenWithdrawalsClarification,
+  askForReferenceIdClarification,
+  noRecordFoundNote,
+} from '../messages/templates';
 import { config } from '../config';
+import { ConversationState } from '../types';
 
 export const webhookRouter = Router();
 
@@ -19,29 +25,106 @@ const RESOLUTION_STATUS_MAP: Record<string, WithdrawalStatus> = {
   failed: 'FAILED',
 };
 
-/**
- * If the customer's message text contains another open conversation's
- * payment_id (in full, or its last 8 characters as a short reference), or
- * unambiguously matches exactly one open conversation's amount, use that
- * conversation instead of the most-recent one. Returns null when no
- * confident match can be made — the caller then falls back to asking the
- * customer to clarify rather than guessing.
- */
-function resolveIntendedConversation(
+async function findConversationByReferenceId(
+  chatId: string,
+  messageText: string
+): Promise<ConversationState | null> {
+  const all = await getAllConversationsByTelegramChatId(chatId);
+  const text = messageText.toLowerCase();
+  const matches = all.filter((c) => {
+    const shortRef = c.payment_id.slice(-8).toLowerCase();
+    return text.includes(c.payment_id.toLowerCase()) || text.includes(shortRef);
+  });
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function resolveIntendedConversationByAmount(
   messageText: string,
   openConversations: Awaited<ReturnType<typeof getOpenConversationsByTelegramChatId>>
 ) {
   const text = messageText.toLowerCase();
-
-  const byReference = openConversations.filter((c) => {
-    const shortRef = c.payment_id.slice(-8).toLowerCase();
-    return text.includes(c.payment_id.toLowerCase()) || text.includes(shortRef);
-  });
-  if (byReference.length === 1) return byReference[0];
-
   const byAmount = openConversations.filter((c) => c.amount != null && text.includes(String(c.amount)));
-  if (byAmount.length === 1) return byAmount[0];
+  return byAmount.length === 1 ? byAmount[0] : null;
+}
 
+function logUnmatchedInbound(chatId: string, messageText: string, reason: string): void {
+  console.warn(
+    `Unmatched inbound Telegram message. chatId=${chatId} reason=${reason} text=${JSON.stringify(messageText)}`
+  );
+}
+
+/**
+ * Resolves which conversation an inbound message (text or photo) belongs to,
+ * using the same reference-first / amount-fallback / ask-if-unclear logic
+ * either way. Returns null (having already replied and closed the request)
+ * when no conversation could be confidently determined — the caller should
+ * stop processing in that case.
+ */
+async function resolveConversationOrRespond(
+  chatId: string,
+  textForMatching: string,
+  res: { sendStatus: (code: number) => void }
+): Promise<ConversationState | null> {
+  const referenceMatch = await findConversationByReferenceId(chatId, textForMatching);
+  if (referenceMatch) return referenceMatch;
+
+  const openConversations = await getOpenConversationsByTelegramChatId(chatId);
+
+  if (openConversations.length === 1) {
+    return openConversations[0];
+  }
+
+  if (openConversations.length > 1) {
+    const matched = resolveIntendedConversationByAmount(textForMatching, openConversations);
+    if (matched) return matched;
+
+    const mostRecent = openConversations[0];
+    if (
+      config.testTelegramChatId &&
+      chatId === config.testTelegramChatId &&
+      !config.testUserIds?.includes(mostRecent.customer_id)
+    ) {
+      console.error(
+        `Telegram message from the TEST_TELEGRAM_CHAT_ID matched conversation ${mostRecent.conversation_id} for customer ${mostRecent.customer_id}, who is not in TEST_USER_IDS. Dropping instead of misattributing it.`
+      );
+      res.sendStatus(200);
+      return null;
+    }
+
+    const clarification = multipleOpenWithdrawalsClarification(
+      openConversations.map((c) => ({ amount: c.amount, currency: c.currency, payment_id: c.payment_id }))
+    );
+    await sendTelegramMessage(chatId, clarification);
+    const now = new Date().toISOString();
+    await insertHistory({
+      conversation_id: mostRecent.conversation_id,
+      customer_id: mostRecent.customer_id,
+      role: 'system',
+      message: clarification,
+      sent_at: now,
+      metadata: { reason: 'multiple_open_withdrawals_clarification' },
+    });
+    res.sendStatus(200);
+    return null;
+  }
+
+  // No reference match AND no open conversations.
+  const allConversations = await getAllConversationsByTelegramChatId(chatId);
+
+  if (allConversations.length === 0) {
+    logUnmatchedInbound(chatId, textForMatching, 'no_conversations_ever');
+    await sendTelegramMessage(chatId, noRecordFoundNote());
+    res.sendStatus(200);
+    return null;
+  }
+
+  if (allConversations.length === 1) {
+    return allConversations[0];
+  }
+
+  logUnmatchedInbound(chatId, textForMatching, 'multiple_past_conversations_no_reference');
+  await sendTelegramMessage(chatId, askForReferenceIdClarification());
+  res.sendStatus(200);
   return null;
 }
 
@@ -50,72 +133,31 @@ webhookRouter.post('/telegram', async (req, res) => {
   try {
     const update = req.body as TelegramUpdate;
     const message = update?.message;
-    if (!message?.text || message.chat?.id === undefined) {
+
+    if (message?.chat?.id === undefined) {
       res.sendStatus(200);
       return;
     }
 
     const chatId = String(message.chat.id);
+    const isPhoto = Boolean(message.photo && message.photo.length > 0);
 
-    const openConversations = await getOpenConversationsByTelegramChatId(chatId);
-    if (openConversations.length === 0) {
-      // Nothing to attach this to. Most likely this chat has no open withdrawal
-      // conversation (or was never linked). We don't have a fallback table for
-      // unmatched inbound messages per the current schema, so just log and drop.
-      console.warn(`Telegram message from chat ${chatId} matched no open conversation, dropping.`);
+    if (!message.text && !isPhoto) {
+      // Some other update type we don't handle (sticker, voice note, etc).
       res.sendStatus(200);
       return;
     }
 
-    let convo = openConversations[0];
+    // For matching purposes, a photo's caption (if any) is treated the same
+    // way as a text message's body — a customer can attach a reference
+    // number as the caption. If there's no caption, matching falls through
+    // to the same open-conversation / all-conversation logic as any other
+    // ambiguous message.
+    const textForMatching = isPhoto ? (message.caption ?? '') : message.text!;
 
-    if (openConversations.length > 1) {
-      const matched = resolveIntendedConversation(message.text, openConversations);
-      if (matched) {
-        convo = matched;
-      } else {
-        // Defense-in-depth check (see below) still applies to whichever
-        // conversation we'd otherwise pick, so run it against convo before
-        // sending the clarification, same as the single-conversation path.
-        if (
-          config.testTelegramChatId &&
-          chatId === config.testTelegramChatId &&
-          !config.testUserIds?.includes(convo.customer_id)
-        ) {
-          console.error(
-            `Telegram message from the TEST_TELEGRAM_CHAT_ID matched conversation ${convo.conversation_id} for customer ${convo.customer_id}, who is not in TEST_USER_IDS. Dropping instead of misattributing it.`
-          );
-          res.sendStatus(200);
-          return;
-        }
+    const convo = await resolveConversationOrRespond(chatId, textForMatching, res);
+    if (!convo) return; // already responded inside resolveConversationOrRespond
 
-        const clarification = multipleOpenWithdrawalsClarification(
-          openConversations.map((c) => ({ amount: c.amount, currency: c.currency, payment_id: c.payment_id }))
-        );
-        await sendTelegramMessage(chatId, clarification);
-        const now = new Date().toISOString();
-        // Logged against the most recent conversation purely so it's visible
-        // somewhere in history; it isn't a real answer to either withdrawal.
-        await insertHistory({
-          conversation_id: convo.conversation_id,
-          customer_id: convo.customer_id,
-          role: 'system',
-          message: clarification,
-          sent_at: now,
-          metadata: { reason: 'multiple_open_withdrawals_clarification' },
-        });
-        res.sendStatus(200);
-        return;
-      }
-    }
-
-    // Defense-in-depth: the test chat is only ever supposed to represent a customer
-    // in TEST_USER_IDS (that's what the outbound fallback in resolveTelegramChatId
-    // enforces when a conversation is created). If this chat id is the test chat but
-    // the conversation it matched belongs to a customer_id that isn't a test user,
-    // something upstream mislinked it (e.g. a bad /human/link-telegram call) — refuse
-    // to route it as that customer's message rather than silently attaching a real
-    // customer's conversation to the tester's personal chat.
     if (
       config.testTelegramChatId &&
       chatId === config.testTelegramChatId &&
@@ -129,38 +171,68 @@ webhookRouter.post('/telegram', async (req, res) => {
     }
 
     const now = new Date().toISOString();
-    await insertHistory({
-      conversation_id: convo.conversation_id,
-      customer_id: convo.customer_id,
-      role: 'customer',
-      message: message.text,
-      sent_at: now,
-      metadata: null,
-    });
+
+    if (isPhoto) {
+      // Largest/best-quality entry is last in Telegram's array of sizes.
+      const largestPhoto = message.photo![message.photo!.length - 1];
+      let imageUrl: string | null = null;
+      try {
+        imageUrl = await downloadAndStoreTelegramPhoto(largestPhoto.file_id);
+      } catch (err) {
+        console.error(`Failed to download/store Telegram photo for chat ${chatId}`, err);
+      }
+
+      await insertHistory({
+        conversation_id: convo.conversation_id,
+        customer_id: convo.customer_id,
+        role: 'customer',
+        // A non-empty placeholder is required — some downstream consumers
+        // (e.g. the Lovable dashboard's history mapping) filter out rows
+        // with an empty message string.
+        message: message.caption?.trim() || '[Photo attachment]',
+        sent_at: now,
+        metadata: imageUrl ? { image_url: imageUrl } : { image_upload_failed: true },
+      });
+    } else {
+      await insertHistory({
+        conversation_id: convo.conversation_id,
+        customer_id: convo.customer_id,
+        role: 'customer',
+        message: message.text!,
+        sent_at: now,
+        metadata: null,
+      });
+    }
+
     await updateConversation(convo.conversation_id, { last_webhook_flag_at: now });
 
     const humanOwnsIt = Boolean(convo.taken_over_by) || convo.status === 'human_required';
     if (humanOwnsIt) {
       // Logged above; a human is driving this one, so the AI stays out of it.
+      // This applies to photos too — a screenshot sent while a human owns
+      // the conversation is simply visible to them, no AI reply drafted.
       res.sendStatus(200);
       return;
+    }
+
+    if (isPhoto) {
+      // A bare photo (no caption asking a specific question) doesn't need an
+      // AI-drafted reply — it's just evidence attached to the conversation
+      // for whoever looks at it next (human, or the Wednesday Slack/Pay777
+      // verification flow). If there IS a caption, fall through below and
+      // let the agent respond to it like any other message.
+      if (!message.caption?.trim()) {
+        res.sendStatus(200);
+        return;
+      }
     }
 
     const [fullHistory, scenario] = await Promise.all([
       getHistoryForConversation(convo.conversation_id),
       getScenarioContext(convo.conversation_id),
     ]);
-    // Only the last few turns matter for replying to the current message —
-    // sending the entire history overwhelms a small model with repeated
-    // generic check-ins and makes it default to stock phrasing.
     const history = fullHistory.slice(-6);
 
-    // Narrow timing gap: getOpenConversationsByTelegramChatId excludes
-    // status === 'resolved', but a real-world resolution can land between
-    // poll cycles. If a resolution_outcome was already recorded on this row
-    // (e.g. set moments ago but the status flip hasn't been picked up by the
-    // next poll yet), answer against the real recorded outcome instead of
-    // assuming PENDING.
     const current_status: WithdrawalStatus =
       convo.resolution_outcome && RESOLUTION_STATUS_MAP[convo.resolution_outcome]
         ? RESOLUTION_STATUS_MAP[convo.resolution_outcome]

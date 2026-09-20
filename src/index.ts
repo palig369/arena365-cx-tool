@@ -8,7 +8,7 @@ async function main(): Promise<void> {
     console.log(`CX tool server listening on port ${config.port}`);
   });
 
-  const intervalMs = config.pollIntervalMinutes * 60 * 1000;
+  const intervalMs = config.pollIntervalSeconds * 1000;
 
   const tick = async () => {
     try {

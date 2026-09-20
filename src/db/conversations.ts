@@ -9,7 +9,12 @@ export async function getOpenConversations(): Promise<ConversationState[]> {
   return (data ?? []) as ConversationState[];
 }
 
-/** Which of these payment_ids already have a conversation_state row (any status). */
+export async function getConversationsForPolling(): Promise<ConversationState[]> {
+  const { data, error } = await supabase.from('conversation_state').select('*');
+  if (error) throw new Error(`Supabase error (getConversationsForPolling): ${error.message}`);
+  return (data ?? []) as ConversationState[];
+}
+
 export async function getKnownPaymentIds(paymentIds: string[]): Promise<Set<string>> {
   if (paymentIds.length === 0) return new Set();
   const { data, error } = await supabase
@@ -20,10 +25,6 @@ export async function getKnownPaymentIds(paymentIds: string[]): Promise<Set<stri
   return new Set((data ?? []).map((r: { payment_id: string }) => r.payment_id));
 }
 
-/**
- * The feed doesn't carry a Telegram chat id, so when a customer has an earlier
- * (any status) conversation with one linked, carry it forward onto the new one.
- */
 export async function getMostRecentTelegramChatIdForCustomer(customerId: string): Promise<string | null> {
   const { data, error } = await supabase
     .from('conversation_state')
@@ -37,7 +38,6 @@ export async function getMostRecentTelegramChatIdForCustomer(customerId: string)
   return data?.telegram_chat_id ?? null;
 }
 
-/** Most recent open (non-resolved) conversation linked to this Telegram chat. */
 export async function getOpenConversationByTelegramChatId(chatId: string): Promise<ConversationState | null> {
   const { data, error } = await supabase
     .from('conversation_state')
@@ -51,7 +51,6 @@ export async function getOpenConversationByTelegramChatId(chatId: string): Promi
   return (data as ConversationState) ?? null;
 }
 
-/** All open (non-resolved) conversations linked to this Telegram chat, most recent first. */
 export async function getOpenConversationsByTelegramChatId(chatId: string): Promise<ConversationState[]> {
   const { data, error } = await supabase
     .from('conversation_state')
@@ -63,7 +62,16 @@ export async function getOpenConversationsByTelegramChatId(chatId: string): Prom
   return (data ?? []) as ConversationState[];
 }
 
-/** All conversations, optionally filtered, ordered by most recent activity first. */
+export async function getAllConversationsByTelegramChatId(chatId: string): Promise<ConversationState[]> {
+  const { data, error } = await supabase
+    .from('conversation_state')
+    .select('*')
+    .eq('telegram_chat_id', chatId)
+    .order('first_seen_at', { ascending: false });
+  if (error) throw new Error(`Supabase error (getAllConversationsByTelegramChatId): ${error.message}`);
+  return (data ?? []) as ConversationState[];
+}
+
 export async function getConversations(filters: {
   status?: ConversationStatus;
   category?: string;
@@ -71,12 +79,6 @@ export async function getConversations(filters: {
   let query = supabase.from('conversation_state').select('*');
   if (filters.status) query = query.eq('status', filters.status);
   if (filters.category) query = query.eq('category', filters.category);
-
-  // updated_at is bumped on every write to the row (status changes, new
-  // messages, checkin_count, taken_over_by, ...), so it's the one column that
-  // always reflects the most recent activity — unlike first_seen_at (set once)
-  // or agent_last_message_at / last_webhook_flag_at (each only tracks one
-  // direction of message and can be null).
   query = query.order('updated_at', { ascending: false });
 
   const { data, error } = await query;
@@ -84,7 +86,6 @@ export async function getConversations(filters: {
   return (data ?? []) as ConversationState[];
 }
 
-/** Counts of conversations per status, for the traffic-light dashboard. */
 export async function getConversationStatusCounts(): Promise<Record<ConversationStatus, number>> {
   const entries = await Promise.all(
     ALL_STATUSES.map(async (status) => {
@@ -106,10 +107,6 @@ export async function getConversationById(conversationId: string): Promise<Conve
     .eq('conversation_id', conversationId)
     .maybeSingle();
   if (error) {
-    // conversation_id is a uuid column — Postgres rejects a non-UUID string
-    // with 22P02 instead of just matching zero rows. Callers (including the
-    // GET /conversations/:id routes) treat a null return as "not found", so
-    // a malformed id should look the same as a missing one, not a 500.
     if (error.code === '22P02') return null;
     throw new Error(`Supabase error (getConversationById): ${error.message}`);
   }

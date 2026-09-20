@@ -12,7 +12,7 @@ import {
 } from '../feed/withdrawalFeed';
 import { FeedAlert } from '../feed/types';
 import {
-  getOpenConversations,
+  getConversationsForPolling,
   getKnownPaymentIds,
   getMostRecentTelegramChatIdForCustomer,
   createConversation,
@@ -35,9 +35,6 @@ const STATUS_MAP: Record<string, WithdrawalStatus> = {
   failed: 'FAILED',
 };
 
-// Only the last few turns matter for drafting the next message — sending the
-// entire history overwhelms a small model with repeated generic check-ins and
-// makes it default to stock phrasing. Mirrors webhookRoutes.ts.
 const HISTORY_WINDOW = 6;
 
 async function getRecentHistory(conversationId: string): Promise<HistoryMessage[]> {
@@ -124,8 +121,6 @@ async function handleNewWithdrawal(alert: FeedAlert, now: Date, allAlerts: FeedA
     if (category === 'unknown') {
       // fall through to normal pending flow
     } else {
-      // Brand-new conversation, so there's no prior history to fetch yet —
-      // this is intentionally the one call site where [] is correct.
       const output = await draftAgentMessage({
         withdrawal_id: conversation.payment_id,
         amount: conversation.amount,
@@ -155,7 +150,6 @@ async function handleNewWithdrawal(alert: FeedAlert, now: Date, allAlerts: FeedA
 
   const initialProgressNote = isApprovedSubmittedRemark(matched?.remark) ? APPROVED_SUBMITTED_PROGRESS_NOTE : null;
 
-  // Also a brand-new conversation with no prior history — [] is correct here too.
   const output = await draftAgentMessage({
     withdrawal_id: conversation.payment_id,
     amount: conversation.amount,
@@ -197,6 +191,15 @@ async function handleResolved(convo: ConversationState, allAlerts: FeedAlert[]):
   const category = outcome?.category ?? 'unknown';
   console.log(`handleResolved: payment_id=${convo.payment_id} category=${category} humanOwnsIt=${humanOwnsIt}`);
 
+  if (category === 'unknown') {
+    console.log(`handleResolved: payment_id=${convo.payment_id} category is unknown, holding for next cycle`);
+    return;
+  }
+
+  if (convo.status === 'resolved' && convo.resolution_outcome === category) {
+    return;
+  }
+
   if (humanOwnsIt) {
     await logAndMaybeSend({
       conversation: convo,
@@ -209,11 +212,6 @@ async function handleResolved(convo: ConversationState, allAlerts: FeedAlert[]):
       resolution_outcome: category,
       resolution_reason: outcome?.rawRemark ?? null,
     });
-    return;
-  }
-
-  if (category === 'unknown') {
-    console.log(`handleResolved: payment_id=${convo.payment_id} category is unknown, holding for next cycle`);
     return;
   }
 
@@ -247,7 +245,7 @@ async function handleResolved(convo: ConversationState, allAlerts: FeedAlert[]):
     resolution_outcome: category,
     resolution_reason: outcome?.rawRemark ?? null,
   });
-  console.log(`handleResolved: payment_id=${convo.payment_id} marked resolved`);
+  console.log(`handleResolved: payment_id=${convo.payment_id} marked resolved (outcome=${category})`);
 }
 
 async function sendProgressUpdate(convo: ConversationState): Promise<void> {
@@ -330,9 +328,15 @@ export async function runPollCycle(): Promise<void> {
   const alerts = await fetchWithdrawalFeed();
   const feedByPaymentId = new Map(alerts.map((a) => [a.paymentId, a]));
 
-  const openConversations = await getOpenConversations();
+  const conversations = await getConversationsForPolling();
 
-  for (const convo of openConversations) {
+  // Stopped rechecking already-resolved withdrawals on every poll cycle —
+  // this was wasted work with no webhook to catch reversals anyway. Once
+  // Satyam's webhook exists, remove this filter so reversal detection
+  // (RESOLVED IS NOT FINAL) can resume.
+  const activeConversations = conversations.filter((c) => c.status !== 'resolved');
+
+  for (const convo of activeConversations) {
     try {
       const feedAlert = feedByPaymentId.get(convo.payment_id);
       let progressTransition = false;
@@ -349,7 +353,10 @@ export async function runPollCycle(): Promise<void> {
         const wasApprovedSubmitted = isApprovedSubmittedRemark(convo.last_known_remark);
         const isApprovedSubmittedNow = isApprovedSubmittedRemark(effectiveRemark);
         progressTransition =
-          feedAlert.status === 'pending' && isApprovedSubmittedNow && !wasApprovedSubmitted;
+          convo.status !== 'resolved' &&
+          feedAlert.status === 'pending' &&
+          isApprovedSubmittedNow &&
+          !wasApprovedSubmitted;
 
         await updateConversation(convo.conversation_id, {
           last_known_status: effectiveStatus,
@@ -360,7 +367,7 @@ export async function runPollCycle(): Promise<void> {
       }
 
       const stillPending = feedAlert ? feedAlert.status === 'pending' : false;
-      console.log(`payment_id=${convo.payment_id} feedAlert.status=${feedAlert?.status ?? 'NOT IN FEED'} stillPending=${stillPending}`);
+      console.log(`payment_id=${convo.payment_id} status=${convo.status} feedAlert.status=${feedAlert?.status ?? 'NOT IN FEED'} stillPending=${stillPending}`);
 
       if (!stillPending) {
         await handleResolved(convo, alerts);
