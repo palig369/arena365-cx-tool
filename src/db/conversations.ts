@@ -9,6 +9,23 @@ export async function getOpenConversations(): Promise<ConversationState[]> {
   return (data ?? []) as ConversationState[];
 }
 
+// Counts how many non-resolved conversations a customer currently has, across
+// every channel — used to decide has_multiple_open_withdrawals for
+// draftAgentMessage, so the reference number gets restated on every message
+// once a customer has more than one withdrawal open at the same time.
+export async function countOpenConversationsForCustomer(customerId: string): Promise<number> {
+  const { count, error } = await supabase
+    .from('conversation_state')
+    .select('*', { count: 'exact', head: true })
+    .eq('customer_id', customerId)
+    .neq('status', 'resolved');
+  if (error) {
+    console.error(`Supabase error (countOpenConversationsForCustomer): ${error.message}`);
+    return 0; // fail safe: behave as single-withdrawal rather than throw
+  }
+  return count ?? 0;
+}
+
 export async function getConversationsForPolling(): Promise<ConversationState[]> {
   const { data, error } = await supabase.from('conversation_state').select('*');
   if (error) throw new Error(`Supabase error (getConversationsForPolling): ${error.message}`);

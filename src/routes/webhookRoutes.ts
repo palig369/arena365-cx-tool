@@ -3,12 +3,14 @@ import { TelegramUpdate, sendTelegramMessage, downloadAndStoreTelegramPhoto } fr
 import {
   getOpenConversationsByTelegramChatId,
   getAllConversationsByTelegramChatId,
+  countOpenConversationsForCustomer,
   insertHistory,
   updateConversation,
   getHistoryForConversation,
   getScenarioContext,
 } from '../db/conversations';
 import { draftAgentMessage, CHECKIN_INTERVAL_MINUTES, WithdrawalStatus } from '../ai/drafts';
+import { detectAndTranslateToEnglish, translateFromEnglish, SupportedLanguage } from '../ai/translate';
 import {
   multipleOpenWithdrawalsClarification,
   askForReferenceIdClarification,
@@ -94,7 +96,11 @@ async function resolveConversationOrRespond(
     const clarification = multipleOpenWithdrawalsClarification(
       openConversations.map((c) => ({ amount: c.amount, currency: c.currency, payment_id: c.payment_id }))
     );
-    await sendTelegramMessage(chatId, clarification);
+    const localizedClarification = await translateFromEnglish(
+      clarification,
+      (mostRecent.customer_language ?? 'en') as SupportedLanguage
+    );
+    await sendTelegramMessage(chatId, localizedClarification);
     const now = new Date().toISOString();
     await insertHistory({
       conversation_id: mostRecent.conversation_id,
@@ -182,6 +188,15 @@ webhookRouter.post('/telegram', async (req, res) => {
         console.error(`Failed to download/store Telegram photo for chat ${chatId}`, err);
       }
 
+      // A caption is translated to English before storage, exactly like a
+      // plain text message — see the else-branch below for why.
+      const captionText = message.caption?.trim() || '';
+      const captionTranslation = captionText ? await detectAndTranslateToEnglish(captionText) : null;
+      if (captionTranslation && captionTranslation.detectedLanguage !== convo.customer_language) {
+        await updateConversation(convo.conversation_id, { customer_language: captionTranslation.detectedLanguage });
+        convo.customer_language = captionTranslation.detectedLanguage;
+      }
+
       await insertHistory({
         conversation_id: convo.conversation_id,
         customer_id: convo.customer_id,
@@ -189,18 +204,35 @@ webhookRouter.post('/telegram', async (req, res) => {
         // A non-empty placeholder is required — some downstream consumers
         // (e.g. the Lovable dashboard's history mapping) filter out rows
         // with an empty message string.
-        message: message.caption?.trim() || '[Photo attachment]',
+        message: captionTranslation ? captionTranslation.englishText : '[Photo attachment]',
         sent_at: now,
-        metadata: imageUrl ? { image_url: imageUrl } : { image_upload_failed: true },
+        metadata: {
+          ...(imageUrl ? { image_url: imageUrl } : { image_upload_failed: true }),
+          ...(captionText
+            ? { original_text: captionText, detected_language: captionTranslation?.detectedLanguage }
+            : {}),
+        },
       });
     } else {
+      // Detect the customer's language and translate their message to
+      // English before it ever reaches history or draftAgentMessage — the
+      // withdrawal-agent prompt only ever reasons over English text. The
+      // original text is preserved in metadata for audit purposes, and the
+      // conversation's remembered language is updated so outbound messages
+      // (here and from poll.ts's proactive check-ins) know what to reply in.
+      const translation = await detectAndTranslateToEnglish(message.text!);
+      if (translation.detectedLanguage !== convo.customer_language) {
+        await updateConversation(convo.conversation_id, { customer_language: translation.detectedLanguage });
+        convo.customer_language = translation.detectedLanguage;
+      }
+
       await insertHistory({
         conversation_id: convo.conversation_id,
         customer_id: convo.customer_id,
         role: 'customer',
-        message: message.text!,
+        message: translation.englishText,
         sent_at: now,
-        metadata: null,
+        metadata: { original_text: message.text, detected_language: translation.detectedLanguage },
       });
     }
 
@@ -227,9 +259,10 @@ webhookRouter.post('/telegram', async (req, res) => {
       }
     }
 
-    const [fullHistory, scenario] = await Promise.all([
+    const [fullHistory, scenario, openCount] = await Promise.all([
       getHistoryForConversation(convo.conversation_id),
       getScenarioContext(convo.conversation_id),
+      countOpenConversationsForCustomer(convo.customer_id),
     ]);
     const history = fullHistory.slice(-6);
 
@@ -250,11 +283,18 @@ webhookRouter.post('/telegram', async (req, res) => {
       trigger_type: 'USER_REPLY',
       next_check_in_minutes: current_status === 'PENDING' ? CHECKIN_INTERVAL_MINUTES : null,
       pending_update_count: convo.pending_update_count,
+      has_multiple_open_withdrawals: openCount > 1,
       message_history: history.map((h) => ({ role: h.role, message: h.message })),
     });
 
     if (output.send) {
-      await sendTelegramMessage(chatId, output.message);
+      // draftAgentMessage always reasons and responds in English; localize
+      // to the customer's detected language right before sending. History
+      // keeps the English version so future draftAgentMessage calls and any
+      // internal review stay in one consistent language.
+      const targetLanguage = (convo.customer_language ?? 'en') as SupportedLanguage;
+      const localizedMessage = await translateFromEnglish(output.message, targetLanguage);
+      await sendTelegramMessage(chatId, localizedMessage);
       const replyAt = new Date().toISOString();
       await insertHistory({
         conversation_id: convo.conversation_id,
@@ -262,13 +302,23 @@ webhookRouter.post('/telegram', async (req, res) => {
         role: 'agent',
         message: output.message,
         sent_at: replyAt,
-        metadata: null,
+        metadata: targetLanguage !== 'en' ? { localized_text: localizedMessage, sent_language: targetLanguage } : null,
       });
       await updateConversation(convo.conversation_id, { agent_last_message_at: replyAt });
     }
 
     if (output.escalate) {
-      await updateConversation(convo.conversation_id, { status: 'human_required' });
+      // Escalation flags the conversation for human attention — it does NOT
+      // silence the agent by setting status to 'human_required'. That status
+      // is reserved for an actual manual "Take Control" click in the
+      // dashboard. If we ever decide escalation SHOULD auto-hand-off to a
+      // human (e.g. specifically for legal/regulatory triggers, or after
+      // repeated escalations on the same conversation), that logic belongs
+      // here — deliberately, not as a side effect of every escalate:true.
+      await updateConversation(convo.conversation_id, {
+        escalation_flagged: true,
+        escalation_reason: output.escalation_reason,
+      });
     }
 
     res.sendStatus(200);

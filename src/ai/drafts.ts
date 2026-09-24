@@ -3,6 +3,12 @@ import { ConversationRole } from '../types';
 
 export const CHECKIN_INTERVAL_MINUTES = 1;
 
+// DEBUG: when SHOW_RAW_REASONS=true in .env, every reason is treated as
+// customer-safe AND the raw reason text is appended to every sent message.
+// Set to false (or remove from .env) before any real customer or demo.
+const SHOW_RAW_REASONS = process.env.SHOW_RAW_REASONS === 'true';
+const DEBUG_TAG_PREFIX = '[DEBUG raw reason:';
+
 export type WithdrawalStatus = 'PENDING' | 'COMPLETED' | 'FAILED' | 'REJECTED';
 export type TriggerType = 'AUTOMATED_LOOP' | 'USER_REPLY';
 
@@ -34,6 +40,7 @@ export interface AgentInput {
   next_check_in_minutes: number | null;
   pending_update_count: number;
   progress_update?: string | null;
+  has_multiple_open_withdrawals?: boolean;
   message_history: HistoryMessage[];
 }
 
@@ -113,6 +120,10 @@ describe this withdrawal, as a plain reference number the customer can quote
 if they contact support again (for example: "reference [withdrawal_id]").
 Never call it a "payment ID", "transaction ID", or any other internal-sounding
 name — just "reference". Do not repeat it on every message.
+
+If has_multiple_open_withdrawals is true, restate the reference in EVERY
+message for this withdrawal (overrides the "once" rule above) — this is what
+lets the customer and you tell their conversations apart.
 
 If amount or currency is null, do not mention an amount at all — do not
 invent one and do not say "your withdrawal" awkwardly to avoid it; just refer
@@ -266,6 +277,13 @@ reference unless doing so avoids ambiguity.
 If pending_update_count is 4 or more: acknowledge the length of the wait once,
 plainly, without apologising repeatedly and without offering an explanation the
 input does not support.
+
+Regardless of what verified_customer_reason contains (e.g. "Held for manual
+approval," internal notes, system names), never mention it, quote it, or
+hint at it in this automated update — say only that the withdrawal is still
+pending, no reason given. This applies even if reason_is_customer_safe is
+true; a safe reason is only shared in direct response to a question (see
+STATE_PENDING_USER_REPLY), never volunteered here.
 
 # REAL VARIATION IS REQUIRED (READ THIS CAREFULLY)
 
@@ -639,6 +657,7 @@ function buildUserPrompt(input: AgentInput): string {
     trigger_type: input.trigger_type,
     next_check_in_minutes: input.next_check_in_minutes,
     pending_update_count: input.pending_update_count,
+    has_multiple_open_withdrawals: input.has_multiple_open_withdrawals ?? false,
   });
 }
 
@@ -665,6 +684,26 @@ function validateAgentOutput(raw: unknown): AgentOutput | null {
   };
 }
 
+// DEBUG: removes the appended raw-reason tag from past agent messages, so the
+// model never sees it in history and never starts imitating it.
+function stripDebugTag(message: string): string {
+  const index = message.indexOf(`\n\n${DEBUG_TAG_PREFIX}`);
+  return index === -1 ? message : message.slice(0, index);
+}
+
+// DEBUG: appends the exact raw reason (or a note that it was empty) to
+// messages for REJECTED/FAILED withdrawals only — never on PENDING check-ins,
+// where a reason should never be volunteered regardless of debug mode.
+function withDebugReason(output: AgentOutput, rawReason: string | null, status: WithdrawalStatus): AgentOutput {
+  const isResolvedNegative = status === 'REJECTED' || status === 'FAILED';
+  if (!SHOW_RAW_REASONS || !isResolvedNegative || !output.send || output.message.trim() === '') return output;
+  const trimmed = rawReason?.trim();
+  const tag = trimmed
+    ? `${DEBUG_TAG_PREFIX} ${trimmed}]`
+    : `${DEBUG_TAG_PREFIX} empty in feed]`;
+  return { ...output, message: `${output.message}\n\n${tag}` };
+}
+
 function buildConversation(
   input: AgentInput,
   historyAsChat: { role: 'user' | 'assistant'; content: string }[]
@@ -684,10 +723,23 @@ function buildConversation(
   return [...historyAsChat, stateMessage];
 }
 
-export async function draftAgentMessage(input: AgentInput): Promise<AgentOutput> {
+export async function draftAgentMessage(originalInput: AgentInput): Promise<AgentOutput> {
+  const rawReason = originalInput.verified_customer_reason;
+
+  console.log(
+    `RAW REASON for ${originalInput.withdrawal_id} [${originalInput.current_status}]: ${
+      rawReason ? `"${rawReason}"` : '(empty)'
+    } (safe=${originalInput.reason_is_customer_safe}, debug=${SHOW_RAW_REASONS})`
+  );
+
+  const input: AgentInput =
+    SHOW_RAW_REASONS && rawReason
+      ? { ...originalInput, reason_is_customer_safe: true }
+      : originalInput;
+
   const historyAsChat = input.message_history.map((h) => ({
     role: (h.role === 'customer' ? 'user' : 'assistant') as 'user' | 'assistant',
-    content: h.message,
+    content: stripDebugTag(h.message),
   }));
 
   const messages = [
@@ -702,7 +754,7 @@ export async function draftAgentMessage(input: AgentInput): Promise<AgentOutput>
     { maxTokens: 200 }
   );
 
-  let output = validateAgentOutput(raw);
+  const output = validateAgentOutput(raw);
 
   if (!output) {
     console.log(`draftAgentMessage: MALFORMED_INPUT. Raw model output was: ${JSON.stringify(raw)}`);
@@ -726,8 +778,8 @@ export async function draftAgentMessage(input: AgentInput): Promise<AgentOutput>
     if (!retryOutput || retryOutput.message.trim() === '') {
       return fallbackOutput('MALFORMED_INPUT');
     }
-    return retryOutput;
+    return withDebugReason(retryOutput, rawReason, input.current_status);
   }
 
-  return output;
+  return withDebugReason(output, rawReason, input.current_status);
 }

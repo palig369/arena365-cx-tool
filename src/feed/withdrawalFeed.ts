@@ -128,13 +128,23 @@ export function findResolvedOutcome(paymentId: string, allAlerts: FeedAlert[]): 
   // Pass 1: does any alert's own top-level paymentId/status match, and is
   // that status non-pending? This is the authoritative, current answer -
   // check it before ever consulting a nested recentWithdrawals copy.
+  //
+  // The top-level alert carries its own `reason` field, confirmed live via
+  // curl on 2026-09-24, which updates promptly alongside `status`. The
+  // nested recentWithdrawals[] remark can stay stale/frozen on the original
+  // placeholder for hours after resolution (confirmed on payment_id
+  // 6ab4b5880ec99d159c97150f: rejected with reason "wrong wallet id" at the
+  // top level, while the nested copy still showed the pre-rejection
+  // placeholder). Always prefer ownAlert.reason; fall back to the nested
+  // remark only if the top-level reason is missing.
   const ownAlert = allAlerts.find((a) => a.paymentId === paymentId);
   if (ownAlert && ownAlert.status && ownAlert.status !== 'pending') {
     const match = ownAlert.player?.recentWithdrawals?.find((w) => w._id === paymentId);
+    const resolvedRemark = ownAlert.reason ?? match?.remark ?? null;
     return {
-      category: classifyOutcome(ownAlert.status, match?.remark ?? null),
+      category: classifyOutcome(ownAlert.status, resolvedRemark),
       rawStatus: ownAlert.status,
-      rawRemark: match?.remark ?? null,
+      rawRemark: resolvedRemark,
     };
   }
 

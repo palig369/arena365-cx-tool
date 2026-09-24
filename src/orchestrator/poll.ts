@@ -15,6 +15,7 @@ import {
   getConversationsForPolling,
   getKnownPaymentIds,
   getMostRecentTelegramChatIdForCustomer,
+  countOpenConversationsForCustomer,
   createConversation,
   updateConversation,
   insertHistory,
@@ -24,6 +25,7 @@ import {
 } from '../db/conversations';
 import { sendTelegramMessage } from '../channels/telegram';
 import { draftAgentMessage, WithdrawalStatus, CHECKIN_INTERVAL_MINUTES, HistoryMessage } from '../ai/drafts';
+import { translateFromEnglish, SupportedLanguage } from '../ai/translate';
 import { resolvedWhileTakenOverNote } from '../messages/templates';
 
 const APPROVED_SUBMITTED_PROGRESS_NOTE =
@@ -56,7 +58,9 @@ async function logAndMaybeSend(params: {
   if (sendToCustomer) {
     const chatId = resolveTelegramChatId(conversation.customer_id, conversation.telegram_chat_id);
     if (chatId) {
-      await sendTelegramMessage(String(chatId), message);
+      const targetLanguage = (conversation.customer_language ?? 'en') as SupportedLanguage;
+      const localizedMessage = await translateFromEnglish(message, targetLanguage);
+      await sendTelegramMessage(String(chatId), localizedMessage);
     }
   }
 
@@ -114,6 +118,9 @@ async function handleNewWithdrawal(alert: FeedAlert, now: Date, allAlerts: FeedA
     eta_text: etaText,
   });
 
+  const openCount = await countOpenConversationsForCustomer(conversation.customer_id);
+  const has_multiple_open_withdrawals = openCount > 1;
+
   if (alert.status !== 'pending') {
     const outcome = findResolvedOutcome(alert.paymentId, allAlerts);
     const category = outcome?.category ?? 'unknown';
@@ -133,6 +140,7 @@ async function handleNewWithdrawal(alert: FeedAlert, now: Date, allAlerts: FeedA
         trigger_type: 'AUTOMATED_LOOP',
         next_check_in_minutes: null,
         pending_update_count: 0,
+        has_multiple_open_withdrawals,
         message_history: [],
       });
 
@@ -163,6 +171,7 @@ async function handleNewWithdrawal(alert: FeedAlert, now: Date, allAlerts: FeedA
     next_check_in_minutes: CHECKIN_INTERVAL_MINUTES,
     pending_update_count: 0,
     progress_update: initialProgressNote,
+    has_multiple_open_withdrawals,
     message_history: [],
   });
 
@@ -215,9 +224,10 @@ async function handleResolved(convo: ConversationState, allAlerts: FeedAlert[]):
     return;
   }
 
-  const [scenario, history] = await Promise.all([
+  const [scenario, history, openCount] = await Promise.all([
     getScenarioContext(convo.conversation_id),
     getRecentHistory(convo.conversation_id),
+    countOpenConversationsForCustomer(convo.customer_id),
   ]);
 
   const output = await draftAgentMessage({
@@ -232,6 +242,7 @@ async function handleResolved(convo: ConversationState, allAlerts: FeedAlert[]):
     trigger_type: 'AUTOMATED_LOOP',
     next_check_in_minutes: null,
     pending_update_count: convo.pending_update_count,
+    has_multiple_open_withdrawals: openCount > 1,
     message_history: history,
   });
 
@@ -251,9 +262,10 @@ async function handleResolved(convo: ConversationState, allAlerts: FeedAlert[]):
 async function sendProgressUpdate(convo: ConversationState): Promise<void> {
   if (convo.taken_over_by) return;
 
-  const [scenario, history] = await Promise.all([
+  const [scenario, history, openCount] = await Promise.all([
     getScenarioContext(convo.conversation_id),
     getRecentHistory(convo.conversation_id),
+    countOpenConversationsForCustomer(convo.customer_id),
   ]);
 
   const output = await draftAgentMessage({
@@ -269,6 +281,7 @@ async function sendProgressUpdate(convo: ConversationState): Promise<void> {
     next_check_in_minutes: CHECKIN_INTERVAL_MINUTES,
     pending_update_count: convo.pending_update_count,
     progress_update: APPROVED_SUBMITTED_PROGRESS_NOTE,
+    has_multiple_open_withdrawals: openCount > 1,
     message_history: history,
   });
 
@@ -291,9 +304,10 @@ async function maybeCheckin(convo: ConversationState, now: Date): Promise<void> 
     (now.getTime() - new Date(convo.agent_last_message_at).getTime()) / 60000;
   if (minutesSinceLastMessage < CHECKIN_INTERVAL_MINUTES) return;
 
-  const [scenario, history] = await Promise.all([
+  const [scenario, history, openCount] = await Promise.all([
     getScenarioContext(convo.conversation_id),
     getRecentHistory(convo.conversation_id),
+    countOpenConversationsForCustomer(convo.customer_id),
   ]);
 
   const output = await draftAgentMessage({
@@ -308,6 +322,7 @@ async function maybeCheckin(convo: ConversationState, now: Date): Promise<void> 
     trigger_type: 'AUTOMATED_LOOP',
     next_check_in_minutes: CHECKIN_INTERVAL_MINUTES,
     pending_update_count: convo.pending_update_count,
+    has_multiple_open_withdrawals: openCount > 1,
     message_history: history,
   });
 
@@ -330,11 +345,15 @@ export async function runPollCycle(): Promise<void> {
 
   const conversations = await getConversationsForPolling();
 
-  // Stopped rechecking already-resolved withdrawals on every poll cycle —
-  // this was wasted work with no webhook to catch reversals anyway. Once
-  // Satyam's webhook exists, remove this filter so reversal detection
-  // (RESOLVED IS NOT FINAL) can resume.
-  const activeConversations = conversations.filter((c) => c.status !== 'resolved');
+  // REVERTED 2026-09-23: Satyam confirmed a webhook fires on every status
+  // change, including reversals after resolution (e.g. completed -> rejected),
+  // reusing the same withdrawal_id with a new eventId — "use the latest event
+  // per _id as the current status." That was the missing piece the temporary
+  // filter below was waiting on, so resolved conversations are rechecked on
+  // every poll cycle again. handleResolved() already no-ops when the category
+  // hasn't actually changed (see its early return), so this does not cause
+  // duplicate messages on conversations that are still genuinely resolved.
+  const activeConversations = conversations;
 
   for (const convo of activeConversations) {
     try {
@@ -348,7 +367,12 @@ export async function runPollCycle(): Promise<void> {
           feedAlert.status && feedAlert.status !== 'pending'
             ? feedAlert.status
             : (matched?.status ?? feedAlert.status ?? null);
-        const effectiveRemark = matched?.remark ?? null;
+        // Same reasoning as findResolvedOutcome in withdrawalFeed.ts: prefer
+        // the top-level feedAlert.reason (updates promptly) over the nested
+        // recentWithdrawals remark (can stay stale/frozen for hours after
+        // resolution — confirmed live on payment_id
+        // 6ab4b5880ec99d159c97150f on 2026-09-24).
+        const effectiveRemark = feedAlert.reason ?? matched?.remark ?? null;
 
         const wasApprovedSubmitted = isApprovedSubmittedRemark(convo.last_known_remark);
         const isApprovedSubmittedNow = isApprovedSubmittedRemark(effectiveRemark);
@@ -367,7 +391,15 @@ export async function runPollCycle(): Promise<void> {
       }
 
       const stillPending = feedAlert ? feedAlert.status === 'pending' : false;
-      console.log(`payment_id=${convo.payment_id} status=${convo.status} feedAlert.status=${feedAlert?.status ?? 'NOT IN FEED'} stillPending=${stillPending}`);
+      // Logs every conversation the poller knows about — not gated by
+      // TEST_USER_IDS in any way. That setting only affects whether an
+      // actual Telegram message gets sent (resolveTelegramChatId), never
+      // what's printed here. amount/currency/payment_id (used as the
+      // customer-facing reference) are included so a withdrawal's details
+      // are visible without cross-checking the Lovable dashboard.
+      console.log(
+        `payment_id=${convo.payment_id} status=${convo.status} amount=${convo.amount ?? 'null'} currency=${convo.currency ?? 'null'} feedAlert.status=${feedAlert?.status ?? 'NOT IN FEED'} stillPending=${stillPending}`
+      );
 
       if (!stillPending) {
         await handleResolved(convo, alerts);

@@ -46,9 +46,11 @@ export interface FeedAlert {
   amount: string;
   currency: string;
   status: string;
+  reason: string | null;
   createdAt: string;
   updatedAt: string | null;
   flaggedAt: string;
+  statusChangedAt: string | null;
   player: FeedPlayer;
 }
 
